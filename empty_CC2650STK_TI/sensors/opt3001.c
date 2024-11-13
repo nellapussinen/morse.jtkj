@@ -67,17 +67,10 @@ uint16_t opt3001_get_status(I2C_Handle *i2c) {
 /**************** JTKJ: DO NOT MODIFY ANYTHING ABOVE THIS LINE ****************/
 
 double opt3001_get_data(I2C_Handle *i2c) {
-
-    // JTKJ: Tehtävä 2. Muokkaa funktiota niin että se palauttaa mittausarvon lukseina
-    // JTKJ: Exercise 2. Complete this function to return the measured value as lux
-
     double lux = -1.0; // return value of the function
-    // JTKJ: Find out the correct buffer sizes (n) with this sensor?
-    uint8_t txBuffer[ 1 ];
-    uint8_t rxBuffer[ 2 ];
+    uint8_t txBuffer[1];
+    uint8_t rxBuffer[2];
 
-    // JTKJ: Fill in the i2cMessage data structure with correct values
-    //       as shown in the lecture material
     I2C_Transaction i2cMessage;
     i2cMessage.slaveAddress = Board_OPT3001_ADDR;
     txBuffer[0] = OPT3001_REG_RESULT;
@@ -87,25 +80,18 @@ double opt3001_get_data(I2C_Handle *i2c) {
     i2cMessage.readCount = 2;
 
     if (opt3001_get_status(i2c) & OPT3001_DATA_READY) {
-
         if (I2C_transfer(*i2c, &i2cMessage)) {
-
-            uint16_t rekisteri = rxBuffer[0]<<8;
+            uint16_t rekisteri = rxBuffer[0] << 8;
             rekisteri = rekisteri | rxBuffer[1];
 
-            // JTKJ: Here the conversion from register value to lux
-            //char merkkijono[50];
-            uint8_t E = (rekisteri>> 12) & 0x0F;
+            uint8_t E = (rekisteri >> 12) & 0x0F;
             uint16_t R = rekisteri & 0x0FFF;
 
             lux = 0.01 * pow(2, E) * R;
-
         } else {
-
             System_printf("OPT3001: Data read failed!\n");
             System_flush();
         }
-
     } else {
         System_printf("OPT3001: Data not ready!\n");
         System_flush();

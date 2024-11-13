@@ -1,170 +1,165 @@
-// C Standard library
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
-#include <inttypes.h>
-
-// XDCtools files
-#include <xdc/std.h>
 #include <xdc/runtime/System.h>
-
-// BIOS Header files
-#include <ti/drivers/i2c/I2CCC26XX.h>
 #include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Clock.h>
 #include <ti/sysbios/knl/Task.h>
 #include <ti/drivers/PIN.h>
-#include <ti/drivers/pin/PINCC26XX.h>
 #include <ti/drivers/I2C.h>
-#include <ti/drivers/Power.h>
-#include <ti/drivers/power/PowerCC26XX.h>
 #include <ti/drivers/UART.h>
-
-// Board Header files
 #include "Board.h"
+#include "sensors/opt3001.h"
 #include "sensors/mpu9250.h"
-#include "buzzer.h"
 
-// Function prototypes
-void sendToUART(UART_Handle uart, const char* message);
-void uartFxn(UART_Handle handle, void *rxBuf, size_t len);
-void debugFxn(void);
-void sendMorse(char symbol);
-void encodeMorse(char *text);
-
-// Morse Code table: A-Z, 0-9
-const char* morseCode[] = {
-    ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--..", // A-Z
-    "-----", ".----", "..---", "...--", "....-", ".....", "-....", "--...", "---..", "----.", // 0-9
-};
-
-#define BUFFERLENGTH 80
-
-// State machine
-enum stateTamagotchi {
-    WAITING = 1, // Waiting for action
-    RIGHT,       // Tilted right
-    UP,          // Tilted upwards
-    TOP,         // Tilted topwards
-    BUTTON       // Button pressed
-};
-
-enum stateTamagotchi programState = WAITING;
-
-// Task
+/* Task */
 #define STACKSIZE 2048
 Char sensorTaskStack[STACKSIZE];
 Char uartTaskStack[STACKSIZE];
 
-// RTOS-variables and PIN configuration
+// State machine states
+enum state { WAITING=1, DATA_READY, DOT, DASH, SPACE };
+enum state programState = WAITING;
+
+// Global variables
+double ambientLight = -1000.0;
+float ax, ay, az, gx, gy, gz;
+
+// Button and LED configuration
 static PIN_Handle buttonHandle;
 static PIN_State buttonState;
 static PIN_Handle ledHandle;
 static PIN_State ledState;
-static PIN_Handle buzzerHandle;
-static PIN_State buzzerState;
+PIN_Config buttonConfig[] = {
+    Board_BUTTON0 | PIN_INPUT_EN | PIN_PULLUP | PIN_IRQ_NEGEDGE,
+    PIN_TERMINATE
+};
+PIN_Config ledConfig[] = {
+    Board_LED0 | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,
+    PIN_TERMINATE
+};
 
-// Declare the uart handle as a global variable
-UART_Handle uart;
-
-// Function to send a message via UART
-void sendToUART(UART_Handle uart, const char* message) {
-    UART_write(uart, message, strlen(message));
-}
-
-// Function to send Morse code symbol
-void sendMorse(char symbol) {
-    switch(symbol) {
-        case '.':
-            sendToUART(uart, ".\r\n");
-            break;
-        case '-':
-            sendToUART(uart, "-\r\n");
-            break;
-        case ' ':
-            sendToUART(uart, " \r\n");
-            break;
+void buttonFxn(PIN_Handle handle, PIN_Id pinId) {
+    // Handle button press
+    if (pinId == Board_BUTTON0) {
+        // Example: Toggle LED
+        PIN_setOutputValue(ledHandle, Board_LED0, !PIN_getOutputValue(Board_LED0));
     }
 }
 
-// Encode the message to Morse code and send it via UART
-void encodeMorse(char *text) {
-    while (*text) {
-        if (*text == ' ') {
-            sendToUART(uart, " \r\n");  // Word separator
-            sendToUART(uart, " \r\n");  // Add extra space for word separation
-        } else {
-            // Convert char to uppercase for consistency
-            char c = (*text >= 'a' && *text <= 'z') ? *text - 'a' + 'A' : *text;
-            if (c >= 'A' && c <= 'Z') {
-                sendToUART(uart, morseCode[c - 'A']);
-                sendToUART(uart, "\r\n");  // Each character in Morse is separated by a newline
-            } else if (c >= '0' && c <= '9') {
-                sendToUART(uart, morseCode[c - '0' + 26]);
-                sendToUART(uart, "\r\n");
-            }
-        }
-        text++;
-    }
-    sendToUART(uart, "\r\n\r\n");  // End the message with 3 spaces
-}
-
-// UART Task
+/* Task Functions */
 Void uartTaskFxn(UArg arg0, UArg arg1) {
-    // UART connection setup
+    UART_Handle uart;
     UART_Params uartParams;
-    UART_Params_init(&uartParams);
-    uartParams.writeDataMode = UART_DATA_TEXT;
-    uartParams.readDataMode = UART_DATA_TEXT;
-    uartParams.readEcho = UART_ECHO_OFF;
-    uartParams.readMode = UART_MODE_BLOCKING;
-    uartParams.baudRate = 9600;
-    uartParams.dataLength = UART_LEN_8;
-    uartParams.parityType = UART_PAR_NONE;
-    uartParams.stopBits = UART_STOP_ONE;
 
-    // Open UART
+    // Initialize UART
+    UART_Params_init(&uartParams);
+    uartParams.baudRate = 9600;
     uart = UART_open(Board_UART0, &uartParams);
     if (uart == NULL) {
         System_abort("Error opening the UART");
     }
 
     while (1) {
-        // Morse encoding logic based on the program state
-        if (programState == BUTTON) {
-            encodeMorse("hello world");  // Example message to send
-            programState = WAITING;  // Reset state after sending
+        if (programState == DATA_READY) {
+            // Send sensor data over UART
+            char buffer[128];
+            snprintf(buffer, sizeof(buffer), "ax: %f, ay: %f, az: %f, gx: %f, gy: %f, gz: %f\n", ax, ay, az, gx, gy, gz);
+            UART_write(uart, buffer, strlen(buffer));
+
+            // Provide feedback to the user
+            PIN_setOutputValue(ledHandle, Board_LED0, 1); // Turn on LED
+            Task_sleep(500000 / Clock_tickPeriod); // 500 ms delay
+            PIN_setOutputValue(ledHandle, Board_LED0, 0); // Turn off LED
+
+            // Reset state
+            programState = WAITING;
         }
 
-        Task_sleep(1000000 / Clock_tickPeriod);  // Task sleep
+        // Once per second, you can modify this
+        Task_sleep(1000000 / Clock_tickPeriod);
     }
 }
 
-// Sensor Task
 Void sensorTaskFxn(UArg arg0, UArg arg1) {
-    // Sensor task logic here (accelerometer and button press handling)
+    I2C_Handle i2c;
+    I2C_Params i2cParams;
+
+    // Initialize I2C
+    I2C_Params_init(&i2cParams);
+    i2c = I2C_open(Board_I2C, &i2cParams);
+    if (i2c == NULL) {
+        System_abort("Error Initializing I2C\n");
+    }
+
+    // Initialize MPU9250
+    mpu9250_setup(&i2c);
+
     while (1) {
-        // Simulating state change based on sensor values (add your sensor logic here)
-        if (/* condition based on sensor data */) {
-            programState = BUTTON;  // Change to BUTTON state when condition met
+        // Read sensor data
+        mpu9250_get_data(&i2c, &ax, &ay, &az, &gx, &gy, &gz);
+
+      // Process sensor data to recognize commands
+        if (ax > 1.0) {
+            programState = DOT; // Quick tilt to the right
+        } else if (ax < -1.0) {
+            programState = DASH; // Quick tilt to the left
+        } else if (az > 1.0) {
+            programState = SPACE; // Quick upward movement
+        } else {
+            programState = WAITING;
         }
-        Task_sleep(1000000 / Clock_tickPeriod);  // Task sleep
+
+        // Save the sensor value into the global variable
+        ambientLight = ax; // Example: save ax value, modify as needed
+
+        // Print sensor data to Debug window
+        System_printf("ax: %f, ay: %f, az: %f, gx: %f, gy: %f, gz: %f\n", ax, ay, az, gx, gy, gz);
+        System_flush();
+
+        // Once per second, you can modify this
+        Task_sleep(1000000 / Clock_tickPeriod);
     }
 }
 
-// Main function
-void main(void) {
-    // Initialize board drivers
-    Board_init();
+Int main(void) {
+    // Task variables
+    Task_Handle sensorTaskHandle;
+    Task_Params sensorTaskParams;
+    Task_Handle uartTaskHandle;
+    Task_Params uartTaskParams;
 
-    // Setup UART and GPIO
-    uart_init();
-    gpio_init();
+    // Initialize board
+    Board_initGeneral();
+    I2C_init();
+    UART_init();
 
-    // Initialize sensor task and UART task
-    Task_create(sensorTaskFxn, sensorTaskStack, NULL);
-    Task_create(uartTaskFxn, uartTaskStack, NULL);
+    // Initialize button and LED pins
+    buttonHandle = PIN_open(&buttonState, buttonConfig);
+    if (!buttonHandle) {
+        System_abort("Error initializing button pins\n");
+    }
+    if (PIN_registerIntCb(buttonHandle, &buttonFxn) != 0) {
+        System_abort("Error registering button callback function");
+    }
+    ledHandle = PIN_open(&ledState, ledConfig);
+    if (!ledHandle) {
+        System_abort("Error initializing LED pins\n");
+    }
+
+    // Initialize tasks
+    Task_Params_init(&sensorTaskParams);
+    sensorTaskParams.stackSize = STACKSIZE;
+    sensorTaskParams.stack = &sensorTaskStack;
+    sensorTaskParams.priority = 2;
+    sensorTaskHandle = Task_create(sensorTaskFxn, &sensorTaskParams, NULL);
+
+    Task_Params_init(&uartTaskParams);
+    uartTaskParams.stackSize = STACKSIZE;
+    uartTaskParams.stack = &uartTaskStack;
+    uartTaskParams.priority = 2;
+    uartTaskHandle = Task_create(uartTaskFxn, &uartTaskParams, NULL);
 
     // Start BIOS
     BIOS_start();
+    return 0;
 }
