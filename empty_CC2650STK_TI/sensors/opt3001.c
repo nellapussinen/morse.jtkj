@@ -79,21 +79,16 @@ double opt3001_get_data(I2C_Handle *i2c) {
     i2cMessage.readBuf = rxBuffer;
     i2cMessage.readCount = 2;
 
-    if (opt3001_get_status(i2c) & OPT3001_DATA_READY) {
-        if (I2C_transfer(*i2c, &i2cMessage)) {
-            uint16_t rekisteri = rxBuffer[0] << 8;
-            rekisteri = rekisteri | rxBuffer[1];
+    if (I2C_transfer(*i2c, &i2cMessage)) {
+        uint16_t rekisteri = rxBuffer[0] << 8;
+        rekisteri = rekisteri | rxBuffer[1];
 
-            uint8_t E = (rekisteri >> 12) & 0x0F;
-            uint16_t R = rekisteri & 0x0FFF;
+        uint8_t E = (rekisteri >> 12) & 0x0F;
+        uint16_t R = rekisteri & 0x0FFF;
 
-            lux = 0.01 * pow(2, E) * R;
-        } else {
-            System_printf("OPT3001: Data read failed!\n");
-            System_flush();
-        }
+        lux = 0.01 * pow(2, E) * R;
     } else {
-        System_printf("OPT3001: Data not ready!\n");
+        System_printf("OPT3001: Data read failed!\n");
         System_flush();
     }
 

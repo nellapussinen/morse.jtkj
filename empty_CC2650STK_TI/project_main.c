@@ -1,28 +1,41 @@
+/* C Standard library */
 #include <stdio.h>
 #include <string.h>
+
+/* XDCtools files */
+#include <xdc/std.h>
 #include <xdc/runtime/System.h>
+
+/* BIOS Header files */
 #include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Clock.h>
 #include <ti/sysbios/knl/Task.h>
 #include <ti/drivers/PIN.h>
+#include <ti/drivers/pin/PINCC26XX.h>
 #include <ti/drivers/I2C.h>
+#include <ti/drivers/Power.h>
+#include <ti/drivers/power/PowerCC26XX.h>
 #include <ti/drivers/UART.h>
+
+/* Board Header files */
 #include "Board.h"
 #include "sensors/opt3001.h"
 #include "sensors/mpu9250.h"
 
-/* Task */
+// Task
 #define STACKSIZE 2048
 Char sensorTaskStack[STACKSIZE];
 Char uartTaskStack[STACKSIZE];
 
 // State machine states
-enum state { WAITING=1, DATA_READY, DOT, DASH, SPACE };
+enum state { WAITING=1, DATA_READY, DOT, DASH, SPACE, SOS, MAYDAY };
 enum state programState = WAITING;
 
 // Global variables
 double ambientLight = -1000.0;
 float ax, ay, az, gx, gy, gz;
+UART_Handle uart;
+I2C_Handle i2c;
 
 // Button and LED configuration
 static PIN_Handle buttonHandle;
@@ -31,6 +44,7 @@ static PIN_Handle ledHandle;
 static PIN_State ledState;
 PIN_Config buttonConfig[] = {
     Board_BUTTON0 | PIN_INPUT_EN | PIN_PULLUP | PIN_IRQ_NEGEDGE,
+    Board_BUTTON1 | PIN_INPUT_EN | PIN_PULLUP | PIN_IRQ_NEGEDGE,
     PIN_TERMINATE
 };
 PIN_Config ledConfig[] = {
@@ -38,20 +52,59 @@ PIN_Config ledConfig[] = {
     PIN_TERMINATE
 };
 
+static int buttonPressCount = 0;
+static Clock_Handle buttonClockHandle;
+static Clock_Struct buttonClockStruct;
+
+void buttonClockFxn(UArg arg) {
+    if (buttonPressCount == 1) {
+        programState = DOT;
+    } else if (buttonPressCount == 2) {
+        programState = DASH;
+    } else if (buttonPressCount == 3) {
+        programState = SPACE;
+    }
+    buttonPressCount = 0;
+}
+
 void buttonFxn(PIN_Handle handle, PIN_Id pinId) {
-    // Handle button press
-    if (pinId == Board_BUTTON0) {
-        // Example: Toggle LED
+    if (pinId == Board_BUTTON1) {
+        buttonPressCount++;
+        Clock_start(buttonClockHandle);
+    } else if (pinId == Board_BUTTON0) {
         PIN_setOutputValue(ledHandle, Board_LED0, !PIN_getOutputValue(Board_LED0));
     }
 }
 
-/* Task Functions */
-Void uartTaskFxn(UArg arg0, UArg arg1) {
-    UART_Handle uart;
-    UART_Params uartParams;
+// Morse code mapping
+typedef struct {
+    char *code;
+    char letter;
+} MorseCode;
 
-    // Initialize UART
+MorseCode morseMap[] = {
+    {".-", 'A'}, {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'}, {".", 'E'},
+    {"..-.", 'F'}, {"--.", 'G'}, {"....", 'H'}, {"..", 'I'}, {".---", 'J'},
+    {"-.-", 'K'}, {".-..", 'L'}, {"--", 'M'}, {"-.", 'N'}, {"---", 'O'},
+    {".--.", 'P'}, {"--.-", 'Q'}, {".-.", 'R'}, {"...", 'S'}, {"-", 'T'},
+    {"..-", 'U'}, {"...-", 'V'}, {".--", 'W'}, {"-..-", 'X'}, {"-.--", 'Y'},
+    {"--..", 'Z'}, {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
+    {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'}, {"---..", '8'},
+    {"----.", '9'}, {NULL, '\0'}
+};
+
+char decodeMorse(char *morse) {
+    int i;
+    for (i = 0; morseMap[i].code != NULL; i++) {
+        if (strcmp(morseMap[i].code, morse) == 0) {
+            return morseMap[i].letter;
+        }
+    }
+    return '?'; // Unknown symbol
+}
+
+Void uartTaskFxn(UArg arg0, UArg arg1) {
+    UART_Params uartParams;
     UART_Params_init(&uartParams);
     uartParams.baudRate = 9600;
     uart = UART_open(Board_UART0, &uartParams);
@@ -60,80 +113,84 @@ Void uartTaskFxn(UArg arg0, UArg arg1) {
     }
 
     while (1) {
-        if (programState == DATA_READY) {
-            // Send sensor data over UART
-            char buffer[128];
-            snprintf(buffer, sizeof(buffer), "ax: %f, ay: %f, az: %f, gx: %f, gy: %f, gz: %f\n", ax, ay, az, gx, gy, gz);
-            UART_write(uart, buffer, strlen(buffer));
-
-            // Provide feedback to the user
-            PIN_setOutputValue(ledHandle, Board_LED0, 1); // Turn on LED
-            Task_sleep(500000 / Clock_tickPeriod); // 500 ms delay
-            PIN_setOutputValue(ledHandle, Board_LED0, 0); // Turn off LED
-
-            // Reset state
+        if (programState == DOT) {
+            char symbol[3] = {'.', '\r', '\n'};
+            UART_write(uart, symbol, 3);
+            programState = WAITING;
+        } else if (programState == DASH) {
+            char symbol[3] = {'-', '\r', '\n'};
+            UART_write(uart, symbol, 3);
+            programState = WAITING;
+        } else if (programState == SPACE) {
+            char symbol[3] = {' ', '\r', '\n'};
+            UART_write(uart, symbol, 3);
             programState = WAITING;
         }
 
-        // Once per second, you can modify this
-        Task_sleep(1000000 / Clock_tickPeriod);
+        Task_sleep(100000 / Clock_tickPeriod); // Check every 100 ms
     }
 }
 
 Void sensorTaskFxn(UArg arg0, UArg arg1) {
-    I2C_Handle i2c;
     I2C_Params i2cParams;
-
-    // Initialize I2C
     I2C_Params_init(&i2cParams);
     i2c = I2C_open(Board_I2C, &i2cParams);
     if (i2c == NULL) {
         System_abort("Error Initializing I2C\n");
     }
 
-    // Initialize MPU9250
     mpu9250_setup(&i2c);
 
     while (1) {
-        // Read sensor data
         mpu9250_get_data(&i2c, &ax, &ay, &az, &gx, &gy, &gz);
 
-      // Process sensor data to recognize commands
         if (ax > 1.0) {
-            programState = DOT; // Quick tilt to the right
+            programState = DOT;
         } else if (ax < -1.0) {
-            programState = DASH; // Quick tilt to the left
+            programState = DASH;
         } else if (az > 1.0) {
-            programState = SPACE; // Quick upward movement
+            programState = SPACE;
         } else {
             programState = WAITING;
         }
 
-        // Save the sensor value into the global variable
-        ambientLight = ax; // Example: save ax value, modify as needed
+        if (programState != WAITING) {
+            PIN_setOutputValue(ledHandle, Board_LED0, 1);  // LED on
 
-        // Print sensor data to Debug window
+            char symbol[4];  // Buffer size 4 characters (symbol + CR + LF + null-terminator)
+
+            // Send UART message based on state
+            if (programState == DOT) {
+                snprintf(symbol, sizeof(symbol), ".\r\n"); // Dot
+                UART_write(uart, symbol, strlen(symbol));
+            } else if (programState == DASH) {
+                snprintf(symbol, sizeof(symbol), "-\r\n"); // Dash
+                UART_write(uart, symbol, strlen(symbol));
+            } else if (programState == SPACE) {
+                snprintf(symbol, sizeof(symbol), " \r\n"); // Space
+                UART_write(uart, symbol, strlen(symbol));
+            }
+
+            Task_sleep(500000 / Clock_tickPeriod);  // 500 ms delay
+            PIN_setOutputValue(ledHandle, Board_LED0, 0);  // LED off
+        }
+
         System_printf("ax: %f, ay: %f, az: %f, gx: %f, gy: %f, gz: %f\n", ax, ay, az, gx, gy, gz);
         System_flush();
 
-        // Once per second, you can modify this
-        Task_sleep(1000000 / Clock_tickPeriod);
+        Task_sleep(1000000 / Clock_tickPeriod);  // 1 second delay before next read
     }
 }
 
 Int main(void) {
-    // Task variables
-    Task_Handle sensorTaskHandle;
     Task_Params sensorTaskParams;
-    Task_Handle uartTaskHandle;
     Task_Params uartTaskParams;
+    Clock_Params clockParams;
 
-    // Initialize board
     Board_initGeneral();
     I2C_init();
     UART_init();
 
-    // Initialize button and LED pins
     buttonHandle = PIN_open(&buttonState, buttonConfig);
     if (!buttonHandle) {
         System_abort("Error initializing button pins\n");
@@ -146,20 +203,24 @@ Int main(void) {
         System_abort("Error initializing LED pins\n");
     }
 
-    // Initialize tasks
+    Clock_Params_init(&clockParams);
+    clockParams.period = 0;
+    clockParams.startFlag = FALSE;
+    Clock_construct(&buttonClockStruct, (Clock_FuncPtr)buttonClockFxn, 500000 / Clock_tickPeriod, &clockParams);
+    buttonClockHandle = Clock_handle(&buttonClockStruct);
+
     Task_Params_init(&sensorTaskParams);
     sensorTaskParams.stackSize = STACKSIZE;
     sensorTaskParams.stack = &sensorTaskStack;
     sensorTaskParams.priority = 2;
-    sensorTaskHandle = Task_create(sensorTaskFxn, &sensorTaskParams, NULL);
+    Task_create(sensorTaskFxn, &sensorTaskParams, NULL);
 
     Task_Params_init(&uartTaskParams);
     uartTaskParams.stackSize = STACKSIZE;
     uartTaskParams.stack = &uartTaskStack;
     uartTaskParams.priority = 2;
-    uartTaskHandle = Task_create(uartTaskFxn, &uartTaskParams, NULL);
+    Task_create(uartTaskFxn, &uartTaskParams, NULL);
 
-    // Start BIOS
     BIOS_start();
     return 0;
 }
